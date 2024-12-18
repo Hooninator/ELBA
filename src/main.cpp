@@ -26,7 +26,7 @@ derivative works, and perform publicly and display publicly, and to permit other
 #include "../include/Utils.hpp"
 #include "../include/ContigGeneration.hpp"
 #include "../include/ReadOverlap.hpp"
-#include "../include/pw/GPULoganAligner.hpp"
+//#include "../include/pw/GPULoganAligner.hpp"
 #include "../include/TransitiveReduction.hpp"
 
 #include "seqan/score/score_matrix_data.h"
@@ -233,98 +233,7 @@ int main(int argc, char **argv)
    * allocates ATmat */
   GenerateKmerByReadMatrix(dfd, Amat, ATmat, parops, tp, nthreads, tu);
 
-  /* allocates Bmat
-   * deletes Amat
-   * deletes ATmat */
-  OverlapDetection(dfd, Bmat, Amat, ATmat, tp, tu);
-
-  /* allocates Rmat
-   * deletes Bmat */
-  PairwiseAlignment(dfd, Bmat, Rmat, parops, tp, tu);
-
-  //////////////////////////////////////////////////////////////////////////////////////
-  // TRANSITIVE REDUCTION                                                             //
-  //////////////////////////////////////////////////////////////////////////////////////
-
-  tp->times["StartMain:TransitiveReduction()"] = std::chrono::system_clock::now();
-
-  bool transitive_reduction = true; // use in development only
-  if (transitive_reduction)
-  {
-    TransitiveReduction(*Rmat, tu);
-  }
-
-  Rmat->Apply(Tupleize());
-
-  tp->times["EndMain:TransitiveReduction()"] = std::chrono::system_clock::now();
-
-#ifdef VERBOSE
-  if(is_print_rank)
-  {
-    std::cout << "Transitive Reduction is done and okay!" << std::endl;
-  }
-#endif
-
-  //////////////////////////////////////////////////////////////////////////////////////
-  // CONTIG EXTRACTION                                                                //
-  //////////////////////////////////////////////////////////////////////////////////////
-
-  tp->times["StartMain:ExtractContig()"] = std::chrono::system_clock::now();
-
-  if(is_print_rank)
-  {
-    std::cout << "\nContig Generation and Local Assembly started: " << std::endl;
-  }
-
-  std::vector<std::string> myContigSet;
-  bool contigging = true;
-
-  if(contigging)
-  {
-    myContigSet = CreateContig(*Rmat, dfd, myoutput, tp, tu);
-  }
-
-  tp->times["EndMain:ExtractContig()"] = std::chrono::system_clock::now();
-
-  delete Rmat;
-
-  tp->times["StartMain:WriteContigs()"] = std::chrono::system_clock::now();
-
-  int64_t number_of_contigs = myContigSet.size();
-  int64_t contigs_offset = 0;
-  MPI_Exscan(&number_of_contigs, &contigs_offset, 1, MPI_INT64_T, MPI_SUM, MPI_COMM_WORLD);
-
-  std::stringstream contig_filecontents;
-
-  for (int i = 0; i < myContigSet.size(); ++i)
-    contig_filecontents << ">contig" << i+contigs_offset << "\tmyrank=" << myrank << "\tmyoffset=" << i << "\n" << myContigSet[i] << "\n";
-
-  MPI_File cfh;
-  MPI_File_open(MPI_COMM_WORLD, "elba.contigs.fa", MPI_MODE_CREATE|MPI_MODE_WRONLY, MPI_INFO_NULL, &cfh);
-
-  std::string cfs = contig_filecontents.str();
-  const char *strout = cfs.c_str();
-
-  MPI_Offset count = strlen(strout);
-  MPI_File_write_ordered(cfh, strout, count, MPI_CHAR, MPI_STATUS_IGNORE);
-  MPI_File_close(&cfh);
-
-  MPI_Barrier(MPI_COMM_WORLD);
-  tp->times["EndMain:WriteContigs()"] = std::chrono::system_clock::now();
-
-  //////////////////////////////////////////////////////////////////////////////////////
-  // SCAFFOLDING                                                                      //
-  //////////////////////////////////////////////////////////////////////////////////////
-
-  // tp->times["StartMain:ScaffoldContig()"] = std::chrono::system_clock::now();
-
-  // bool scaffolding = false;
-  // if(!contigging) scaffolding = false;
-
-  // if(scaffolding)
-  // {
-  //   // GetAssembly(myContigSet, tu);
-  // }
+  Amat->ParallelWriteMM(input_file+".mtx", true);
 
   //////////////////////////////////////////////////////////////////////////////////////
   // END OF PROGRAM                                                                   //
@@ -702,68 +611,3 @@ void OverlapDetection(std::shared_ptr<DistributedFastaData> dfd,
     tp->times["EndMain:DfdWait()"] = std::chrono::system_clock::now();
 }
 
-void PairwiseAlignment(std::shared_ptr<DistributedFastaData> dfd, PSpMat<elba::CommonKmers>::MPI_DCCols* Bmat, PSpMat<ReadOverlap>::MPI_DCCols*& Rmat, const std::shared_ptr<ParallelOps>& parops, const std::shared_ptr<TimePod>& tp, TraceUtils& tu)
-{
-  uint64_t n_rows, n_cols;
-  n_rows = n_cols = dfd->global_count();
-  int gr_rows = parops->grid->GetGridRows();
-  int gr_cols = parops->grid->GetGridCols();
-
-  int gr_col_idx = parops->grid->GetRankInProcRow();
-  int gr_row_idx = parops->grid->GetRankInProcCol();
-
-  uint64_t avg_rows_in_grid = n_rows / gr_rows;
-  uint64_t avg_cols_in_grid = n_cols / gr_cols;
-  uint64_t row_offset = gr_row_idx * avg_rows_in_grid;  // first row in this process
-  uint64_t col_offset = gr_col_idx * avg_cols_in_grid;	// first col in this process
-
-  std::string candidatem = myoutput;
-  candidatem += "-overlap.mtx";
-  Bmat->ParallelWriteMM(candidatem, true, elba::CkOutputMMHandler());
-
-  DistributedPairwiseRunner dpr(dfd, Bmat->seqptr(), Bmat, afreq, row_offset, col_offset, parops);
-
-  double mytime = MPI_Wtime();
-  tp->times["StartMain:DprAlign()"] = std::chrono::system_clock::now();
-  ScoringScheme scoring_scheme(match, mismatch_sc, gap_ext);
-
-  PairwiseFunction* pf = nullptr;
-  uint64_t local_alignments = 1;
-
-  if(gpuAlign)
-  {
-    tu.print_str("GPU-based LOGAN alignment started:\n");
-    
-    pf = new GPULoganAligner(scoring_scheme, klength, xdrop, seed_count);	    
-    dpr.run_batch(pf, proc_log_stream, log_freq, ckthr, aln_score_thr, tu, noAlign, klength, seq_count);
-	  local_alignments = static_cast<GPULoganAligner*>(pf)->nalignments;
-  }
-  else if(cpuAlign)
-  {
-    tu.print_str("CPU-based SeqAn alignment started:\n");
-
-    pf = new SeedExtendXdrop (scoring_scheme, klength, xdrop, seed_count);
-    dpr.run_batch(pf, proc_log_stream, log_freq, ckthr, aln_score_thr, tu, noAlign, klength, seq_count);
-	  local_alignments = static_cast<SeedExtendXdrop*>(pf)->nalignments;
-  }
-
-  tp->times["EndMain:DprAlign()"] = std::chrono::system_clock::now();
-  delete pf;
-
-  uint64_t total_alignments = 0;
-  MPI_Reduce(&local_alignments, &total_alignments, 1, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
-
-  // total_alignments should be zero if "noAlign" is true
-  if(is_print_rank)
-  {
-    std::cout << "#alignment run (L-D-U): " << total_alignments << std::endl;
-  }
-
-  Rmat = new PSpMat<ReadOverlap>::MPI_DCCols(*Bmat);
-
-  std::string postalignment = myoutput;
-  postalignment += "-alignment.mtx";
-  Rmat->ParallelWriteMM(postalignment, true, ReadOverlapGraphHandler());
-
-  delete Bmat;
-}

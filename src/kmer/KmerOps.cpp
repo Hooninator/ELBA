@@ -1281,4 +1281,292 @@ PSpMat<PosInRead>::MPI_DCCols KmerOps::GenerateA(uint64_t seq_count,
     free(totkmers);
     return A;
   }
+
+
+PSpMat<PosInRead>::MPI_DCCols KmerOps::GenerateACounts(uint64_t seq_count,
+      std::shared_ptr<DistributedFastaData> &dfd, ushort k, ushort s,
+      Alphabet &alph, const std::shared_ptr<ParallelOps> &parops,
+      const std::shared_ptr<TimePod> &tp, int nthreads, std::string& myoutput) /*, std::unordered_set<Kmer, Kmer>& local_kmers) */
+  {
+
+   
+  ushort len;
+
+  /* typedef std::vector<uint64_t> uvec_64; */
+  uvec_64 lrow_ids, lcol_ids;
+  std::vector<PosInRead> lvals;
+
+  uint64_t offset = dfd->global_start_idx();
+  FastaData *lfd  = dfd->lfd();
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// GGGG: Cardinality estimation
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+  tp->times["StartKmerOp:GenerateA:CardinalityHLL()"] = std::chrono::system_clock::now();
+
+  /*! GGGG: cardinality estimate */
+  MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
+
+  unsigned int readsxproc = 0;
+  myrank = parops->world_proc_rank;
+
+  double tstart = MPI_Wtime();
+
+  Kmer::set_k(k);
+  double cardinality;
+
+#ifdef USEHLL
+  /* Doesn't update kmersprocessed yet (but updates readsprocessed */
+  ProudlyParallelCardinalityEstimate(lfd, cardinality, k);
+  readsxproc = readsprocessed / nprocs;
+#else // GGGG: this doesn't wotk yet
+  int64_t sums[3] = {0, 0, 0};
+  
+  int64_t &mycardinality = sums[0];
+  int64_t &mytotreads    = sums[1];
+  int64_t &mytotbases    = sums[2];
+
+  mytotreads = lfd->local_count();
+
+  // Vivek: this loop is tiny; it may not be worth parallelizing with OpenMP
+  // And what is the purpose of instantiating myseq? 
+#ifdef THREADED
+#endif
+  #pragma omp parallel for reduction(+:mytotbases)
+  for (uint64_t lseq_idx = 0; lseq_idx < mytotreads; ++lseq_idx)
+  {
+      uint64_t start_offset, end_offset_inclusive;
+      /*! GGGG: loading sequence string in buff */
+      char* buff = lfd->get_sequence(lseq_idx, len, start_offset, end_offset_inclusive);
+
+      string myseq{buff + start_offset, buff + end_offset_inclusive + 1};
+      mytotbases += myseq.size();
+  }
+
+  if (mytotreads > 0)
+  {
+      /*! GGGG: double check k == kmer len */
+      int64_t kmersxread = ((mytotbases + mytotreads - 1) / mytotreads) - k + 1;
+      mycardinality += kmersxread * mytotreads;
+  }
+
+  MPI_Allreduce(MPI_IN_PLACE, sums, 3, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
+
+#ifdef VERBOSE
+  if (myrank == 0)
+  {
+      std::cout << "Estimated cardinality: " << mycardinality << " totreads: " << mytotreads << " totbases: " << mytotbases << std::endl;
+  }
+#endif
+
+  /*! GGGG: from dibella v1 this is baseline for 10M kmers */
+  if (mycardinality < 10000000) mycardinality = 10000000;
+
+  /*! Assume maximum of 90% of the kmers are unique, because at least some have to repeat */
+  cardinality = 0.9 * mycardinality / (double) nprocs;
+  readsxproc = mytotreads / nprocs;
+#endif
+
+  tp->times["EndKmerOp:GenerateA:CardinalityHLL()"] = std::chrono::system_clock::now();
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// GGGG: First pass k-mer counter
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+  /*! Prepare for first pass over input data with k-mer extraction */
+  ASSERT(kmercounts == NULL, "");
+
+  /*! GGGG: what is this? */
+  kmercounts = new KmerCountsType();
+
+  /*! Assume we have at least 10x depth of kmers to store and a minimum 64k */
+  uint64_t reserve = cardinality * 0.1 + 64000; 
+  /*! This is the maximum supported by khash */
+  if (reserve >= 4294967291ul) reserve = 4294967290ul; // 
+
+  /*! GGGG: define this macros */
+  kmercounts->reserve(reserve);
+
+  /* Initialize readNameMap for storing ReadID -> names/tags of reads */
+  /* GGGG: define ReadId type */
+
+  std::unordered_map<ReadId, std::string> readNameMap;
+
+  /*! GGGG: I don't what the original one, I want the new one with consecutive entries; also I only need the first one; it's gonna be incremented later in ParseNPack */
+  uint64_t GlobalReadOffset = dfd->g_seq_offsets[parops->world_proc_rank];  
+  ReadId myReadStartIndex = GlobalReadOffset + 1;
+
+  tp->times["StartKmerOp:GenerateA:FirstPass()"] = std::chrono::system_clock::now();
+
+  /*! GGGG: let's extract the function (I'll separate later once I understood what's going on) */
+  /*! GGGG: functions in KmerCounter.cpp */
+  /*  Determine final hash-table entries using bloom filter */
+  int nreads = ProcessFiles(lfd, 1, cardinality, myReadStartIndex, readNameMap, k, nthreads, myoutput);//, readids);
+
+  tp->times["EndKmerOp:GenerateA:FirstPass()"] = std::chrono::system_clock::now();
+
+  // std::cout << nreads << std::endl;
+  double firstpasstime = MPI_Wtime() - tstart;
+  tstart = MPI_Wtime();
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// GGGG: Second pass k-mer counter        
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+  /*! GGGG: prepare for second pass over the input data, extracting k-mers with read ID's, names, etc. */
+  /* Exchange number of reads-per-processor to calculate read indices */
+  uint64_t sndReadCounts[nprocs];
+
+  for (int i = 0; i < nprocs; i++)
+  {
+    sndReadCounts[i] = nreads;
+  }
+
+  uint64_t recvReadCounts[nprocs];
+
+  CHECK_MPI(MPI_Alltoall(sndReadCounts, 1, MPI_UINT64_T, recvReadCounts, 1, MPI_UINT64_T, MPI_COMM_WORLD));
+  
+  myReadStartIndex = 1;
+  for (int i = 0; i < myrank; i++)
+  {
+    myReadStartIndex += recvReadCounts[i];
+  }
+
+#ifdef DEBUG
+    if(myrank == nprocs - 1)
+      for (int i = 0; i < nprocs; i++)
+        LOGF("recvReadCounts[%lld] = %lld\n", recvReadCounts[i]);
+#endif
+
+  CHECK_MPI(MPI_Barrier(MPI_COMM_WORLD));
+
+  /* Initialize end read ranges */
+  ReadId readRanges[nprocs];
+  ReadId last = 0;
+
+  for (int i = 0; i < nprocs; i++)
+  {
+    readRanges[i] = last + recvReadCounts[i];
+    last += recvReadCounts[i];
+  }
+
+  // DBG("My read range is [%lld - %lld]\n", (myrank==0? 1 : readRanges[myrank-1]+1), readRanges[myrank]);
+  tp->times["StartKmerOp:GenerateA:SecondPass()"] = std::chrono::system_clock::now();
+
+  /* Second pass */
+  ProcessFiles(lfd, 2, cardinality, myReadStartIndex, readNameMap, k, nthreads, myoutput);//, readids);
+
+  tp->times["EndKmerOp:GenerateA:SecondPass()"] = std::chrono::system_clock::now();
+
+  double timesecondpass = MPI_Wtime() - tstart;
+  // serial_printf("%s: 2nd input data pass, elapsed time: %0.3f s\n", __FUNCTION__, timesecondpass);
+  tstart = MPI_Wtime();
+
+  int64_t sendbuf = kmercounts->size(); 
+  int64_t recvbuf, totcount, maxcount;
+
+  CHECK_MPI(MPI_Exscan(&sendbuf, &recvbuf, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD));
+  CHECK_MPI(MPI_Allreduce(&sendbuf, &totcount, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD));
+  CHECK_MPI(MPI_Allreduce(&sendbuf, &maxcount, 1, MPI_LONG_LONG, MPI_MAX, MPI_COMM_WORLD));
+
+  int64_t totkmersprocessed;
+
+  CHECK_MPI(MPI_Reduce(&kmersprocessed, &totkmersprocessed, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
+
+  double timeloadimbalance = MPI_Wtime() - tstart;
+
+#ifdef VERBOSE
+  if(myrank  == 0)
+  {
+    cout << __FUNCTION__ << ": Total number of stored k-mers: " << totcount << endl;
+
+    double imbalance = static_cast<double>(nprocs * maxcount) / static_cast<double>(totcount);  
+    
+    cout << __FUNCTION__ << ": Load imbalance for final k-mer counts: " << imbalance << endl;
+    // cout << __FUNCTION__ << ": CardinalityEstimate " << static_cast<double>(totkmersprocessed) / (MEGA * max((tcardinalitye), 0.001) * nprocs) << " MEGA k-mers per sec/proc in " << (tcardinalitye) << " seconds"<< endl;
+    cout << __FUNCTION__ << ": Bloom filter + hash table (key) initialization " << static_cast<double>(totkmersprocessed) / (MEGA * max((firstpasstime),0.001) * nprocs) << " MEGA k-mers per sec/proc in " << (firstpasstime) << " seconds" << endl;
+    cout << __FUNCTION__ << ": Hash table (value) initialization  " << static_cast<double>(totkmersprocessed) / (MEGA * max((timesecondpass),0.001) * nprocs) << " MEGA k-mers per sec/proc in " << (timesecondpass) << " seconds" << endl;
+  }
+#endif
+
+  // serial_printf("%s: Total time computing load imbalance: %0.3f s\n", __FUNCTION__, timeloadimbalance);
+  CHECK_MPI(MPI_Barrier(MPI_COMM_WORLD));
+ 
+  tstart = MPI_Wtime();
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// GGGG: Build matrix A
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    /*! GGGG: Once k-mers are consolidated in a single global location, 
+     *  the other processors don’t need to know the ids of kmers they sent off to other processors. */
+
+    // std::unordered_map<Kmer::MERARR, uint64_t>* kmerIdMap = new std::unordered_map<Kmer::MERARR, uint64_t>()
+
+    uint64_t mykmers = kmercounts->size();
+    uint64_t *totkmers = (uint64_t *)malloc(sizeof(uint64_t) * nprocs);
+
+    // GGGG: communicate offsets for kmers and check if I need to communicate read ids as well
+    MPI_Allgather(&mykmers, 1, MPI_UINT64_T, totkmers, 1, MPI_UINT64_T, MPI_COMM_WORLD);
+
+    uint64_t kmerid = 0;
+    for(int i = 1; i <= myrank; i++)
+    {
+        kmerid += totkmers[myrank-i];
+    }
+
+    for(auto itr = kmercounts->begin(); itr != kmercounts->end(); ++itr)
+    {
+        /*! kmer string */
+        // Kmer::MERARR key = itr->first;
+        // Kmer mykmer(key);
+
+        /*! GGGG: run tests, read idx should be consistent now */
+        READIDS  readids = get<0>(itr->second);
+        POSITIONS values = get<1>(itr->second);
+
+        for(int j = 0; j < readids.size(); j++)
+        {
+            if(readids[j] != 0)
+            {
+                lcol_ids.push_back(kmerid);
+                lrow_ids.push_back(readids[j] - 1); // -1 bc kmer counter counts from 1
+                lvals.push_back(1);
+            }
+        }
+        kmerid++;
+    }
+
+#ifndef NDEBUG
+  {
+    std::string title = "Local matrix info:";
+    std::string msg   = "lrow_ids row_size: " + 
+                     std::to_string(lrow_ids.size())
+                     + " lcol_ids row_size: " +
+                     std::to_string(lcol_ids.size())
+                     + " lvals row_size: " + 
+                     std::to_string(lvals.size());
+    TraceUtils::print_msg(title, msg, parops);
+  }
+#endif
+
+    assert(lrow_ids.size() == lcol_ids.size() && lcol_ids.size() == lvals.size());
+
+    /*! Create distributed sparse matrix of sequence x kmers */
+    FullyDistVec<uint64_t, uint64_t>    drows(lrow_ids, parops->grid);
+    FullyDistVec<uint64_t, uint64_t>    dcols(lcol_ids, parops->grid);
+    FullyDistVec<uint64_t, PosInRead>   dvals(lvals, parops->grid);
+
+    uint64_t nrows = seq_count;
+    uint64_t ncols = totcount; // GGGG: this is the reliable k-mer space
+
+    tp->times["StartKmerOp:GenerateA:SpMatA()"] = std::chrono::system_clock::now();
+    PSpMat<PosInRead>::MPI_DCCols A(nrows, ncols, drows, dcols, dvals, false);
+    tp->times["EndKmerOp:GenerateA:SpMatA()"]   = std::chrono::system_clock::now();
+   
+    free(totkmers);
+    return A;
+  }
+
 }

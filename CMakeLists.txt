@@ -6,15 +6,15 @@ add_subdirectory($ENV{BLOOM_HOME})
 
 include_directories(
 	  $ENV{SEQAN_HOME}/include 
-      $ENV{COMBBLAS_HOME}/CombBLAS/install/include
-      $ENV{COMBBLAS_HOME}/LoganGPU
+      $ENV{COMBBLAS_HOME}/include
+      #$ENV{COMBBLAS_HOME}/LoganGPU
 	)
 # possibly add path to boost library (not necessary on Cori, just type 'module load boost')
-add_subdirectory($ENV{COMBBLAS_HOME}/LoganGPU)
+#add_subdirectory($ENV{COMBBLAS_HOME}/LoganGPU)
 link_directories(
-        $ENV{COMBBLAS_HOME}/CombBLAS/install/lib 
+        $ENV{COMBBLAS_HOME}/lib 
         $ENV{BLOOM_HOME}/build
-	    $ENV{COMBBLAS_HOME}/LoganGPU/build
+        #$ENV{COMBBLAS_HOME}/LoganGPU/build
   )
      
 if(NOT CMAKE_BUILD_TYPE)
@@ -84,8 +84,6 @@ add_executable(elba
         include/TransitiveReduction.hpp
         include/CC.h
         include/ContigGeneration.hpp
-        include/pw/GPULoganAligner.hpp
-        src/pw/GPULoganAligner.cpp
 	)
 
 # LOWER_KMER_FREQ and UPPER_KMER_FREQ based on E. coli CCS 29x (need to change for any given dataset based on error rate and depth)
@@ -106,7 +104,7 @@ set(FUZZ 1000
     CACHE STRING "Fuzz Value for Transitive Transitive Reduction")
 
 set_property(TARGET elba PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
-set(ELBA_LINK_LIBRARY ${ELBA_LINK_LIBRARY} LOGAN_LIBRARY_static CombBLAS LIBBLOOM-NOUPC MURMURHASH)
+set(ELBA_LINK_LIBRARY ${ELBA_LINK_LIBRARY} CombBLAS LIBBLOOM-NOUPC MURMURHASH)
 target_link_libraries(elba PUBLIC ${ELBA_LINK_LIBRARY})
 
 target_compile_definitions(
